@@ -12,8 +12,9 @@ def run_analysis(plan):
 
     if start_year is None or end_year is None:
         raise ValueError(
-            "Start year and end year are required."
-        )
+        "Please specify a time period, for example "
+        "'from 2015 to 2025' or 'in the last 5 years'."
+    )
 
     location = get_coordinates(location_name)
 
