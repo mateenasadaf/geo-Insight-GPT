@@ -1,36 +1,54 @@
 """
-Vegetation trend analysis using Sentinel-2 imagery from Microsoft
+Water-body analysis using Sentinel-2 imagery from Microsoft
 Planetary Computer.
 
-The analysis uses the exact Polygon/MultiPolygon returned by the
-location resolver instead of a rectangular latitude/longitude AOI.
+Method:
+    MNDWI = (Green - SWIR) / (Green + SWIR)
+
+Water pixels are initially identified using:
+    MNDWI > 0
+
+The analysis is restricted to the exact Polygon/MultiPolygon
+returned by location.py.
+
+Sentinel-2 bands:
+    B03 -> Green (10 m)
+    B11 -> SWIR  (20 m)
+    SCL -> Scene Classification Layer
 
 Processing:
-    Location boundary
+    Exact polygon
         ↓
-    Bounding box for Sentinel search/read
+    Polygon-derived satellite search
         ↓
-    Exact polygon mask
+    Fixed seasonal window
         ↓
-    SCL cloud/shadow/snow masking
+    B03 + B11
         ↓
-    NDVI
+    Resample B11 to B03 grid
         ↓
-    Vegetation percentage
+    SCL masking
+        ↓
+    MNDWI
+        ↓
+    Water pixels
+        ↓
+    Water coverage %
 """
 
-import csv
 import sys
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.append(
+    str(Path(__file__).resolve().parent.parent)
+)
 
 import numpy as np
 import pystac_client
 import planetary_computer
 import rasterio
 
-from rasterio.features import geometry_mask
+from rasterio.features import geometry_mask, bounds
 from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds, transform_geom
 from rasterio.enums import Resampling
@@ -41,51 +59,64 @@ from rasterio.enums import Resampling
 # ---------------------------------------------------------------------
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
 COLLECTION = "sentinel-2-l2a"
 
-# Small buffer used ONLY for finding Sentinel scenes.
-# It is NOT used as the analysis area.
-SEARCH_BUFFER_DEG = 0.1
+# Buffer around the polygon's bounding box for scene search.
+# This is ONLY used for finding candidate satellite scenes.
+SEARCH_BUFFER_DEG = 0.02
 
 MAX_SCENE_CLOUD_COVER = 20
 
-# Require at least this fraction of the actual polygon area
-# to contain valid pixels after cloud/shadow masking.
 MIN_VALID_PIXEL_FRACTION = 0.5
 
-NDVI_VEGETATION_THRESHOLD = 0.3
-
-# Sentinel-2 Scene Classification Layer (SCL) codes to exclude:
-# 0 = no data
-# 1 = saturated/defective
-# 3 = cloud shadow
-# 8 = cloud medium probability
-# 9 = cloud high probability
-# 10 = thin cirrus
-# 11 = snow/ice
-SCL_EXCLUDE_VALUES = {
-    0,
-    1,
-    3,
-    8,
-    9,
-    10,
-    11
-}
+# Initial MNDWI threshold.
+WATER_MNDWI_THRESHOLD = 0.0
 
 SENTINEL2_SCALE = 10000.0
 
 
 # ---------------------------------------------------------------------
-# NDVI
+# Fixed seasonal window
 # ---------------------------------------------------------------------
 
-def calculate_ndvi(red, nir):
+# Keep the same months for every year to reduce seasonal bias.
+#
+# You can change these later depending on the region.
+#
+# January -> March
+SEASON_START_MONTH = 1
+SEASON_END_MONTH = 3
 
-    denominator = nir + red
+
+# ---------------------------------------------------------------------
+# Sentinel-2 SCL values to exclude
+# ---------------------------------------------------------------------
+
+SCL_EXCLUDE_VALUES = {
+    0,   # No data
+    1,   # Saturated / defective
+    3,   # Cloud shadow
+    8,   # Cloud medium probability
+    9,   # Cloud high probability
+    10,  # Thin cirrus
+    11   # Snow / ice
+}
+
+
+# ---------------------------------------------------------------------
+# MNDWI
+# ---------------------------------------------------------------------
+
+def calculate_mndwi(
+    green,
+    swir
+):
+
+    denominator = green + swir
 
     return np.divide(
-        nir - red,
+        green - swir,
         denominator,
         out=np.full_like(
             denominator,
@@ -101,34 +132,58 @@ def calculate_ndvi(red, nir):
 # ---------------------------------------------------------------------
 
 def get_candidate_sentinel_images(
-    latitude,
-    longitude,
+    geometry,
     year,
-    buffer_deg=SEARCH_BUFFER_DEG
+    season_start_month=SEASON_START_MONTH,
+    season_end_month=SEASON_END_MONTH
 ):
-    """
-    Return Sentinel-2 scenes sorted by scene-level cloud cover.
-
-    The bounding box is used only to locate candidate satellite scenes.
-    The actual analysis is later restricted to the exact polygon.
-    """
 
     catalog = pystac_client.Client.open(
         STAC_URL,
         modifier=planetary_computer.sign_inplace
     )
 
+    # -------------------------------------------------------------
+    # Use the actual polygon bounds.
+    # -------------------------------------------------------------
+
+    left, bottom, right, top = bounds(
+        geometry
+    )
+
     bbox = [
-        longitude - buffer_deg,
-        latitude - buffer_deg,
-        longitude + buffer_deg,
-        latitude + buffer_deg
+        left - SEARCH_BUFFER_DEG,
+        bottom - SEARCH_BUFFER_DEG,
+        right + SEARCH_BUFFER_DEG,
+        top + SEARCH_BUFFER_DEG
     ]
+
+    # -------------------------------------------------------------
+    # Fixed seasonal window.
+    # -------------------------------------------------------------
+
+    start_date = (
+        f"{year}-"
+        f"{season_start_month:02d}-01"
+    )
+
+    if season_end_month == 12:
+
+        end_date = (
+            f"{year + 1}-01-01"
+        )
+
+    else:
+
+        end_date = (
+            f"{year}-"
+            f"{season_end_month + 1:02d}-01"
+        )
 
     search = catalog.search(
         collections=[COLLECTION],
         bbox=bbox,
-        datetime=f"{year}-01-01/{year + 1}-01-01",
+        datetime=f"{start_date}/{end_date}",
         query={
             "eo:cloud_cover": {
                 "lt": MAX_SCENE_CLOUD_COVER
@@ -136,13 +191,19 @@ def get_candidate_sentinel_images(
         }
     )
 
-    items = list(search.items())
+    items = list(
+        search.items()
+    )
 
     if not items:
+
         raise ValueError(
-            f"No suitable satellite image found for {year}."
+            f"No suitable satellite image found "
+            f"for {year} in the window "
+            f"{start_date} to {end_date}."
         )
 
+    # Least cloudy scene first.
     items.sort(
         key=lambda item:
         item.properties.get(
@@ -163,18 +224,16 @@ def _read_window(
     left,
     bottom,
     right,
-    top
+    top,
+    target_shape=None,
+    resampling=Resampling.nearest
 ):
-    """
-    Read a raster window covering the polygon bounding box.
 
-    The bounding box is only used to efficiently read the required
-    raster area. Pixels outside the polygon are removed later.
-    """
+    with rasterio.open(
+        href
+    ) as src:
 
-    with rasterio.open(href) as src:
-
-        bounds = transform_bounds(
+        bounds_in_crs = transform_bounds(
             "EPSG:4326",
             src.crs,
             left,
@@ -184,20 +243,34 @@ def _read_window(
         )
 
         window = from_bounds(
-            *bounds,
+            *bounds_in_crs,
             transform=src.transform
         )
 
-        out_shape = (
-            max(
-                1,
-                int(round(window.height))
-            ),
-            max(
-                1,
-                int(round(window.width))
+        if target_shape is None:
+
+            out_shape = (
+                max(
+                    1,
+                    int(
+                        round(
+                            window.height
+                        )
+                    )
+                ),
+                max(
+                    1,
+                    int(
+                        round(
+                            window.width
+                        )
+                    )
+                )
             )
-        )
+
+        else:
+
+            out_shape = target_shape
 
         data = src.read(
             1,
@@ -205,7 +278,7 @@ def _read_window(
             boundless=True,
             fill_value=0,
             out_shape=out_shape,
-            resampling=Resampling.nearest
+            resampling=resampling
         ).astype(float)
 
         nodata = (
@@ -214,180 +287,151 @@ def _read_window(
             else 0
         )
 
-        transform = src.window_transform(window)
+        transform = src.window_transform(
+            window
+        )
 
         crs = src.crs
 
-    return data, nodata, transform, crs
+    return (
+        data,
+        nodata,
+        transform,
+        crs
+    )
 
 
 # ---------------------------------------------------------------------
-# Exact polygon AOI processing
+# Read exact polygon AOI
 # ---------------------------------------------------------------------
 
-def _read_aoi_bands(
+def _read_aoi_data(
     image,
     geometry
 ):
-    """
-    Read B04, B08 and SCL for the exact polygon AOI.
-
-    Steps:
-        1. Find polygon bounding box.
-        2. Read raster data covering the bounding box.
-        3. Create an exact polygon mask.
-        4. Apply SCL cloud/shadow/snow masking.
-        5. Return the combined valid-pixel mask.
-    """
 
     # ---------------------------------------------------------------
-    # Get polygon bounding box
+    # Polygon bounding box
     # ---------------------------------------------------------------
-
-    geometry_coordinates = geometry["coordinates"]
-
-    # Use rasterio's geometry bounds helper.
-    from rasterio.features import bounds
 
     left, bottom, right, top = bounds(
         geometry
     )
 
     # ---------------------------------------------------------------
-    # Read red band
+    # B03 = Green, 10 m.
+    #
+    # B03 becomes our reference grid.
     # ---------------------------------------------------------------
 
-    red, red_nodata, red_transform, red_crs = _read_window(
-        image.assets["B04"].href,
-        left,
-        bottom,
-        right,
-        top
+    green, green_nodata, green_transform, green_crs = (
+        _read_window(
+            image.assets["B03"].href,
+            left,
+            bottom,
+            right,
+            top
+        )
     )
 
     # ---------------------------------------------------------------
-    # Read NIR band
+    # B11 = SWIR, native 20 m.
+    #
+    # Resample B11 to the B03 10 m grid.
+    # Bilinear is used because reflectance is continuous.
     # ---------------------------------------------------------------
 
-    nir, nir_nodata, nir_transform, nir_crs = _read_window(
-        image.assets["B08"].href,
-        left,
-        bottom,
-        right,
-        top
+    swir, swir_nodata, swir_transform, swir_crs = (
+        _read_window(
+            image.assets["B11"].href,
+            left,
+            bottom,
+            right,
+            top,
+            target_shape=green.shape,
+            resampling=Resampling.bilinear
+        )
     )
 
     # ---------------------------------------------------------------
-    # Check shape
+    # Check shapes
     # ---------------------------------------------------------------
 
-    if red.shape != nir.shape:
+    if swir.shape != green.shape:
 
         raise ValueError(
-            f"Red/NIR shape mismatch for "
+            f"B03/B11 shape mismatch for "
             f"{image.id}: "
-            f"{red.shape} vs {nir.shape}"
+            f"{green.shape} vs {swir.shape}"
         )
 
     # ---------------------------------------------------------------
-    # Check transform/CRS
+    # Transform exact polygon into raster CRS
     # ---------------------------------------------------------------
 
-    if red_transform != nir_transform:
-
-        raise ValueError(
-            f"Red/NIR transform mismatch for {image.id}"
-        )
-
-    # ---------------------------------------------------------------
-    # Transform polygon into raster CRS
-    # ---------------------------------------------------------------
-
-    polygon_raster_crs = transform_geom(
+    polygon_raster = transform_geom(
         "EPSG:4326",
-        red_crs,
+        green_crs,
         geometry
     )
 
     # ---------------------------------------------------------------
-    # Create exact polygon mask
+    # Exact polygon mask
     # ---------------------------------------------------------------
 
     inside_polygon = geometry_mask(
-        [polygon_raster_crs],
-        out_shape=red.shape,
-        transform=red_transform,
+        [polygon_raster],
+        out_shape=green.shape,
+        transform=green_transform,
         invert=True
     )
 
     # ---------------------------------------------------------------
-    # Basic valid pixel mask
+    # Basic valid-pixel mask
     # ---------------------------------------------------------------
 
     valid = (
-        (red != red_nodata)
+        (green != green_nodata)
         &
-        (nir != nir_nodata)
+        (swir != swir_nodata)
     )
 
-    # IMPORTANT:
-    # Only pixels INSIDE the exact polygon are valid.
+    # Only pixels inside the exact polygon.
     valid &= inside_polygon
 
     # ---------------------------------------------------------------
-    # SCL masking
+    # SCL cloud/shadow masking
     # ---------------------------------------------------------------
 
     if "SCL" in image.assets:
 
-        with rasterio.open(
-            image.assets["SCL"].href
-        ) as scl_src:
+        scl, _, _, _ = _read_window(
+            image.assets["SCL"].href,
+            left,
+            bottom,
+            right,
+            top,
+            target_shape=green.shape,
+            resampling=Resampling.nearest
+        )
 
-            # Transform the polygon bounding box
-            # into the SCL raster CRS
-            scl_bounds = transform_bounds(
-                "EPSG:4326",
-                scl_src.crs,
-                left,
-                bottom,
-                right,
-                top
-            )
-
-            scl_window = from_bounds(
-                *scl_bounds,
-                transform=scl_src.transform
-            )
-
-            # Read SCL and resample it to the
-            # same shape as the B04/B08 arrays
-            scl = scl_src.read(
-                1,
-                window=scl_window,
-                boundless=True,
-                fill_value=0,
-                out_shape=red.shape,
-                resampling=Resampling.nearest
-            )
-
-        # Apply SCL cloud/shadow/snow mask
         for code in SCL_EXCLUDE_VALUES:
+
             valid &= scl != code
 
     return (
-        red,
-        nir,
+        green,
+        swir,
         valid,
         inside_polygon
     )
 
 
 # ---------------------------------------------------------------------
-# Yearly vegetation analysis
+# Yearly water analysis
 # ---------------------------------------------------------------------
 
-def calculate_yearly_vegetation(
+def calculate_yearly_water(
     latitude,
     longitude,
     geometry,
@@ -395,8 +439,7 @@ def calculate_yearly_vegetation(
 ):
 
     candidates = get_candidate_sentinel_images(
-        latitude,
-        longitude,
+        geometry,
         year
     )
 
@@ -407,11 +450,11 @@ def calculate_yearly_vegetation(
         try:
 
             (
-                red,
-                nir,
+                green,
+                swir,
                 valid,
                 inside_polygon
-            ) = _read_aoi_bands(
+            ) = _read_aoi_data(
                 image,
                 geometry
             )
@@ -423,22 +466,24 @@ def calculate_yearly_vegetation(
             continue
 
         # -----------------------------------------------------------
-        # Check polygon
+        # Polygon pixels
         # -----------------------------------------------------------
 
-        polygon_pixels = inside_polygon.sum()
+        polygon_pixels = int(
+            inside_polygon.sum()
+        )
 
         if polygon_pixels == 0:
 
             last_error = ValueError(
-                "Polygon does not overlap the "
-                "satellite image."
+                "Polygon does not overlap "
+                "the satellite image."
             )
 
             continue
 
         # -----------------------------------------------------------
-        # Valid pixel fraction
+        # Valid coverage
         # -----------------------------------------------------------
 
         valid_fraction = (
@@ -450,62 +495,71 @@ def calculate_yearly_vegetation(
         if valid_fraction < MIN_VALID_PIXEL_FRACTION:
 
             last_error = ValueError(
-                f"Only {valid_fraction:.0%} valid pixels "
-                f"inside the exact polygon for "
+                f"Only {valid_fraction:.0%} valid "
+                f"pixels inside polygon for "
                 f"{image.id}."
             )
 
             continue
 
         # -----------------------------------------------------------
-        # Scale Sentinel-2 reflectance
+        # Scale reflectance
         # -----------------------------------------------------------
 
-        red_scaled = (
-            red / SENTINEL2_SCALE
+        green_scaled = (
+            green / SENTINEL2_SCALE
         )
 
-        nir_scaled = (
-            nir / SENTINEL2_SCALE
+        swir_scaled = (
+            swir / SENTINEL2_SCALE
         )
 
         # -----------------------------------------------------------
-        # NDVI
+        # MNDWI
         # -----------------------------------------------------------
 
-        ndvi = calculate_ndvi(
-            red_scaled,
-            nir_scaled
+        mndwi = calculate_mndwi(
+            green_scaled,
+            swir_scaled
         )
 
-        # Only exact polygon + valid pixels
-        ndvi_valid = np.where(
+        mndwi_valid = np.where(
             valid,
-            ndvi,
+            mndwi,
             np.nan
         )
 
         # -----------------------------------------------------------
-        # Vegetation
+        # Water classification
+        #
+        # MNDWI > 0
         # -----------------------------------------------------------
 
-        vegetation_pixels = (
-            ndvi_valid
+        water_pixels = (
+            mndwi_valid
             >
-            NDVI_VEGETATION_THRESHOLD
+            WATER_MNDWI_THRESHOLD
         )
 
-        vegetation_percentage = (
+        # -----------------------------------------------------------
+        # Water percentage
+        # -----------------------------------------------------------
+
+        water_percentage = (
             np.nansum(
-                vegetation_pixels
+                water_pixels
             )
             /
             valid.sum()
         ) * 100
 
-        average_ndvi = float(
+        # -----------------------------------------------------------
+        # Average MNDWI
+        # -----------------------------------------------------------
+
+        average_mndwi = float(
             np.nanmean(
-                ndvi_valid
+                mndwi_valid
             )
         )
 
@@ -535,13 +589,13 @@ def calculate_yearly_vegetation(
         )
 
         print(
-            f"Exact polygon pixels: "
-            f"{polygon_pixels}"
+            "Exact polygon pixels:",
+            polygon_pixels
         )
 
         print(
-            f"Valid polygon pixels: "
-            f"{valid.sum()}"
+            "Valid polygon pixels:",
+            int(valid.sum())
         )
 
         print(
@@ -550,19 +604,19 @@ def calculate_yearly_vegetation(
         )
 
         print(
-            f"Vegetation coverage: "
-            f"{vegetation_percentage:.2f}%"
+            f"Water coverage: "
+            f"{water_percentage:.2f}%"
         )
 
         print(
-            f"Average NDVI: "
-            f"{average_ndvi:.3f}"
+            f"Average MNDWI: "
+            f"{average_mndwi:.3f}"
         )
 
         return {
             "year": year,
-            "vegetation_percentage": vegetation_percentage,
-            "average_ndvi": average_ndvi,
+            "water_percentage": water_percentage,
+            "average_mndwi": average_mndwi,
             "image_id": image.id,
             "image_date": str(
                 image.datetime
@@ -575,47 +629,14 @@ def calculate_yearly_vegetation(
 
     raise ValueError(
         f"No scene for {year} had enough "
-        f"cloud-free coverage inside the exact "
-        f"polygon (last error: {last_error})"
+        f"valid coverage inside the exact "
+        f"polygon "
+        f"(last error: {last_error})"
     )
 
 
 # ---------------------------------------------------------------------
-# CSV
-# ---------------------------------------------------------------------
-
-def save_results_csv(
-    results,
-    path
-):
-
-    if not results:
-        return
-
-    fieldnames = list(
-        results[0].keys()
-    )
-
-    with open(
-        path,
-        "w",
-        newline=""
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames
-        )
-
-        writer.writeheader()
-
-        writer.writerows(
-            results
-        )
-
-
-# ---------------------------------------------------------------------
-# Standalone testing
+# Standalone test
 # ---------------------------------------------------------------------
 
 def main():
@@ -638,12 +659,23 @@ def main():
         location_name
     )
 
-    latitude = location["latitude"]
-    longitude = location["longitude"]
-    geometry = location["geometry"]
+    latitude = location[
+        "latitude"
+    ]
+
+    longitude = location[
+        "longitude"
+    ]
+
+    geometry = location[
+        "geometry"
+    ]
 
     print("\nLocation found:")
-    print(location["name"])
+
+    print(
+        location["name"]
+    )
 
     print(
         "Latitude:",
@@ -669,13 +701,15 @@ def main():
 
         try:
 
+            result = calculate_yearly_water(
+                latitude=latitude,
+                longitude=longitude,
+                geometry=geometry,
+                year=year
+            )
+
             results.append(
-                calculate_yearly_vegetation(
-                    latitude=latitude,
-                    longitude=longitude,
-                    geometry=geometry,
-                    year=year
-                )
+                result
             )
 
         except Exception as error:
@@ -685,12 +719,16 @@ def main():
                 f"{year}: {error}"
             )
 
+    # ---------------------------------------------------------------
+    # Trend
+    # ---------------------------------------------------------------
+
     print(
         "\n\n=============================="
     )
 
     print(
-        f"VEGETATION TREND "
+        f"WATER TREND "
         f"{start_year}-{end_year}"
     )
 
@@ -702,87 +740,38 @@ def main():
 
         print(
             f"{result['year']} : "
-            f"{result['vegetation_percentage']:.2f}%"
+            f"{result['water_percentage']:.2f}%"
         )
+
+    # ---------------------------------------------------------------
+    # Overall change
+    # ---------------------------------------------------------------
 
     if len(results) >= 2:
 
         first = results[0][
-            "vegetation_percentage"
+            "water_percentage"
         ]
 
         last = results[-1][
-            "vegetation_percentage"
+            "water_percentage"
         ]
 
         change = last - first
 
-        print("\nOverall change:")
+        print(
+            "\nOverall change:"
+        )
 
         print(
             f"{change:+.2f} "
             f"percentage points"
         )
 
-        if first != 0:
 
-            print(
-                f"{(change / first) * 100:+.2f}%"
-            )
-
-        else:
-
-            print(
-                "Percentage change undefined "
-                "(starting value was 0%)."
-            )
-
-        if change > 0:
-
-            print(
-                "Trend: Vegetation increased."
-            )
-
-        elif change < 0:
-
-            print(
-                "Trend: Vegetation decreased."
-            )
-
-        else:
-
-            print(
-                "Trend: Vegetation remained stable."
-            )
-
-    output_path = Path(
-        "vegetation_trend_results.csv"
-    )
-
-    save_results_csv(
-        results,
-        output_path
-    )
-
-    print(
-        f"\nResults saved to {output_path}"
-    )
-
-    import datetime
-
-    if (
-        results
-        and results[-1]["year"]
-        == datetime.date.today().year
-    ):
-
-        print(
-            f"\nNote: {results[-1]['year']} "
-            "only covers through the current "
-            "date, so it isn't a like-for-like "
-            "comparison with full prior years."
-        )
-
+# ---------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()

@@ -1,13 +1,14 @@
 from location import get_coordinates
 
 
-location = input(
-    "Enter a city, state or country: "
-)
-
-result = get_coordinates(location)
+location = get_coordinates("Bengaluru")
 
 print("\nLocation found:")
-print("Name:", result["name"])
-print("Latitude:", result["latitude"])
-print("Longitude:", result["longitude"])
+print("Name:", location["name"])
+print("Latitude:", location["latitude"])
+print("Longitude:", location["longitude"])
+
+print("\nGeometry:")
+print("Type:", location["geometry"]["type"])
+
+print("\nBoundary successfully identified!")
