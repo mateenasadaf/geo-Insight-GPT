@@ -476,3 +476,10 @@ Future Prediction
 ```
 
 The prediction feature is an **extension of the existing satellite-analysis pipeline**, not a replacement for it.
+
+<img width="1130" height="786" alt="Screenshot 2026-08-26 124801" src="https://github.com/user-attachments/assets/e311bc3b-ffdf-46b0-a218-589429c3c811" />
+<img width="970" height="636" alt="Screenshot 2026-08-26 124809" src="https://github.com/user-attachments/assets/22941919-7151-4a33-83cb-27ad3e7548d9" />
+
+
+<img width="945" height="730" alt="Screenshot 2026-08-26 124821" src="https://github.com/user-attachments/assets/48f2033d-13fd-4723-b7f6-19da3e329222" />
+
